@@ -12,6 +12,8 @@ from pytorch_lightning.utilities import rank_zero_only
 from einops import rearrange, repeat
 import opt_einsum as oe
 
+import numpy as np
+
 contract = oe.contract
 contract_expression = oe.contract_expression
 
@@ -32,15 +34,15 @@ log = get_logger(__name__)
 
 """ Cauchy and Vandermonde kernels """
 
-try: # Try CUDA extension
-    from extensions.cauchy.cauchy import cauchy_mult
-    has_cauchy_extension = True
-except:
-    log.warning(
-        "CUDA extension for cauchy multiplication not found. Install by going to extensions/cauchy/ and running `python setup.py install`. This should speed up end-to-end training by 10-50%"
-    )
-    has_cauchy_extension = False
-
+#try: # Try CUDA extension
+#    from extensions.cauchy.cauchy import cauchy_mult
+#    has_cauchy_extension = True
+#except:
+#    log.warning(
+#        "CUDA extension for cauchy multiplication not found. Install by going to extensions/cauchy/ and running `python setup.py install`. This should speed up end-to-end training by 10-50%"
+#    )
+has_cauchy_extension = False
+'''
 try: # Try pykeops
     import pykeops
     from pykeops.torch import Genred
@@ -130,40 +132,40 @@ try: # Try pykeops
 
         r = vandermonde_mult(u, v, x, l, backend='GPU')
         return _r2c(r)
-
-except ImportError:
-    has_pykeops = False
-    if not has_cauchy_extension:
-        log.warning(
-            "Falling back on slow Cauchy kernel. Install at least one of pykeops or the CUDA extension for efficiency."
-        )
-        def cauchy_naive(v, z, w):
-            """
-            v, w: (..., N)
-            z: (..., L)
-            returns: (..., L)
-            """
-            cauchy_matrix = v.unsqueeze(-1) / (z.unsqueeze(-2) - w.unsqueeze(-1)) # (... N L)
-            return torch.sum(cauchy_matrix, dim=-2)
-
-    # Vandermonde functions
+'''
+#except ImportError:
+has_pykeops = False
+if not has_cauchy_extension:
     log.warning(
-        "Falling back on slow Vandermonde kernel. Install pykeops for improved memory efficiency."
+        "Falling back on slow Cauchy kernel. Install at least one of pykeops or the CUDA extension for efficiency."
     )
-    def log_vandermonde(v, x, L):
+    def cauchy_naive(v, z, w):
         """
-        v: (..., N)
-        x: (..., N)
-        returns: (..., L) \sum v x^l
+        v, w: (..., N)
+        z: (..., L)
+        returns: (..., L)
         """
-        vandermonde_matrix = torch.exp(x.unsqueeze(-1) * torch.arange(L).to(x)) # (... N L)
-        vandermonde_prod = contract('... n, ... n l -> ... l', v, vandermonde_matrix) # (... L)
-        return 2*vandermonde_prod.real
+        cauchy_matrix = v.unsqueeze(-1) / (z.unsqueeze(-2) - w.unsqueeze(-1)) # (... N L)
+        return torch.sum(cauchy_matrix, dim=-2)
 
-    def log_vandermonde_transpose(u, v, x, L):
-        vandermonde_matrix = torch.exp(x.unsqueeze(-1) * torch.arange(L).to(x)) # (... N L)
-        vandermonde_prod = contract('... l, ... n, ... n l -> ... n', u.to(x), v.to(x), vandermonde_matrix) # (... L)
-        return vandermonde_prod
+# Vandermonde functions
+log.warning(
+    "Falling back on slow Vandermonde kernel. Install pykeops for improved memory efficiency."
+)
+def log_vandermonde(v, x, L):
+    """
+    v: (..., N)
+    x: (..., N)
+    returns: (..., L) \sum v x^l
+    """
+    vandermonde_matrix = torch.exp(x.unsqueeze(-1) * torch.arange(L).to(x)) # (... N L)
+    vandermonde_prod = contract('... n, ... n l -> ... l', v, vandermonde_matrix) # (... L)
+    return 2*vandermonde_prod.real
+
+def log_vandermonde_transpose(u, v, x, L):
+    vandermonde_matrix = torch.exp(x.unsqueeze(-1) * torch.arange(L).to(x)) # (... N L)
+    vandermonde_prod = contract('... l, ... n, ... n l -> ... n', u.to(x), v.to(x), vandermonde_matrix) # (... L)
+    return vandermonde_prod
 
 _conj = lambda x: torch.cat([x, x.conj()], dim=-1)
 _c2r = torch.view_as_real
@@ -1231,7 +1233,7 @@ class SSKernel(nn.Module):
         dt_max=0.1,
         deterministic=False,
         lr=None,
-        mode="nplr",
+        mode="diag",
         n_ssm=None,
         verbose=False,
         measure_args={},
@@ -1404,7 +1406,7 @@ class S4(nn.Module):
 
         self.d_model = d_model
         self.H = d_model
-        self.N = d_state
+        self.N = d_model #d_state
         self.L = l_max
         self.bidirectional = bidirectional
         self.channels = channels
