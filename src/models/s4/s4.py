@@ -13,6 +13,7 @@ from einops import rearrange, repeat
 import opt_einsum as oe
 
 import numpy as np
+import precision_tools as pt
 
 contract = oe.contract
 contract_expression = oe.contract_expression
@@ -42,97 +43,7 @@ log = get_logger(__name__)
 #        "CUDA extension for cauchy multiplication not found. Install by going to extensions/cauchy/ and running `python setup.py install`. This should speed up end-to-end training by 10-50%"
 #    )
 has_cauchy_extension = False
-'''
-try: # Try pykeops
-    import pykeops
-    from pykeops.torch import Genred
-    has_pykeops = True
-    log.info("Pykeops installation found.")
 
-    def _broadcast_dims(*tensors):
-        max_dim = max([len(tensor.shape) for tensor in tensors])
-        tensors = [tensor.view((1,)*(max_dim-len(tensor.shape))+tensor.shape) for tensor in tensors]
-        return tensors
-
-    def cauchy_conj(v, z, w):
-        """ Pykeops version """
-        expr_num = 'z * ComplexReal(v) - Real2Complex(Sum(v * w))'
-        expr_denom = 'ComplexMult(z-w, z-Conj(w))'
-
-        cauchy_mult = Genred(
-            f'ComplexDivide({expr_num}, {expr_denom})',
-            [
-                'v = Vj(2)',
-                'z = Vi(2)',
-                'w = Vj(2)',
-            ],
-            reduction_op='Sum',
-            axis=1,
-        )
-
-        v, z, w = _broadcast_dims(v, z, w)
-        v = _c2r(v)
-        z = _c2r(z)
-        w = _c2r(w)
-
-        r = 2*cauchy_mult(v, z, w, backend='GPU')
-        return _r2c(r)
-
-    def log_vandermonde(v, x, L):
-        expr = 'ComplexMult(v, ComplexExp(ComplexMult(x, l)))'
-        vandermonde_mult = Genred(
-            expr,
-            [
-                'v = Vj(2)',
-                'x = Vj(2)',
-                'l = Vi(2)',
-            ],
-            reduction_op='Sum',
-            axis=1,
-        )
-
-        l = torch.arange(L).to(x)
-        v, x, l = _broadcast_dims(v, x, l)
-        v = _c2r(v)
-        x = _c2r(x)
-        l = _c2r(l)
-
-        r = vandermonde_mult(v, x, l, backend='GPU')
-        return 2*_r2c(r).real
-
-    def log_vandermonde_transpose(u, v, x, L):
-        """
-        u: ... H L
-        v: ... H N
-        x: ... H N
-        Returns: ... H N
-
-        V = Vandermonde(a, L) : (H N L)
-        contract_L(V * u * v)
-        """
-        expr = 'ComplexMult(ComplexMult(v, u), ComplexExp(ComplexMult(x, l)))'
-        vandermonde_mult = Genred(
-            expr,
-            [
-                'u = Vj(2)',
-                'v = Vi(2)',
-                'x = Vi(2)',
-                'l = Vj(2)',
-            ],
-            reduction_op='Sum',
-            axis=1,
-        )
-
-        l = torch.arange(L).to(x)
-        u, v, x, l = _broadcast_dims(u, v, x, l)
-        u = _c2r(u)
-        v = _c2r(v)
-        x = _c2r(x)
-        l = _c2r(l)
-
-        r = vandermonde_mult(u, v, x, l, backend='GPU')
-        return _r2c(r)
-'''
 #except ImportError:
 has_pykeops = False
 if not has_cauchy_extension:
@@ -615,6 +526,7 @@ class SSKernelNPLR(OptimModule):
         real_type='exp', # ['none' | 'exp' | 'relu' | sigmoid']
         real_tolerance=1e-3,
         bandlimit=None,
+        **kernel_args,
     ):
         """
         L: Maximum length; this module computes an SSM kernel of length L
@@ -675,6 +587,26 @@ class SSKernelNPLR(OptimModule):
         self.l_max = L
         self.register_buffer('L', torch.tensor(0)) # Internal length
 
+        if 'A_quant' in kernel_args and kernel_args['A_quant'] is not None:
+            self.A_quant = int(kernel_args['A_quant'])
+        else:
+            self.A_quant = None
+
+        if 'B_quant' in kernel_args and kernel_args['B_quant'] is not None:
+            self.B_quant = int(kernel_args['B_quant'])
+        else:
+            self.B_quant = None
+
+        if 'C_quant' in kernel_args and kernel_args['C_quant'] is not None:
+            self.C_quant = int(kernel_args['C_quant'])
+        else:
+            self.C_quant = None
+
+        if 'dt_quant' in kernel_args and kernel_args['dt_quant'] is not None:
+            self.dt_quant = int(kernel_args['dt_quant'])
+        else:
+            self.dt_quant = None
+
     def _w_init(self, w_real):
         w_real = torch.clamp(w_real, max=-self.real_tolerance)
         if self.real_type == 'none':
@@ -689,7 +621,7 @@ class SSKernelNPLR(OptimModule):
             return torch.log(torch.exp(-w_real)-1)
         else: raise NotImplementedError
 
-    def _w(self):
+    def _w(self, A_quant=None):
         # Get the internal w (diagonal) parameter
         if self.real_type == 'none':
             w_real = -self.inv_w_real
@@ -702,7 +634,11 @@ class SSKernelNPLR(OptimModule):
         elif self.real_type == 'softplus':
             w_real = -F.softplus(self.inv_w_real)
         else: raise NotImplementedError
-        w = w_real + 1j * self.w_imag
+        if A_quant is not None:
+            w = w_real - (w_real - max_quant_fn(w_real, quant_levels=A_quant)).detach() 
+            + 1j * self.w_imag - (self.w_imag - max_quant_fn(self.w_imag, quant_levels=A_quant)).detach()
+        else:
+            w = w_real + 1j * self.w_imag
         return w
 
     def forward(self, state=None, rate=1.0, L=None):
@@ -731,13 +667,25 @@ class SSKernelNPLR(OptimModule):
             self._setup_C(continuous_L)
         discrete_L = round(self.L.item()/rate)
 
-        dt = torch.exp(self.log_dt) * rate
-        B = _r2c(self.B)
-        C = _r2c(self.C)
+        if self.dt_quant is not None:
+            dt = torch.exp((self.log_dt - max_quant_fn(self.log_dt, quant_levels=self.dt_quant)).detach()) * rate
+        else:
+            dt = torch.exp(self.log_dt)
+
+        if self.B_quant is not None:
+            B = _r2c(self.B - (self.B - max_quant_fn(self.B, quant_levels=self.B_quant)).detach())
+        else:
+            B = _r2c(self.B)
+
+        if self.C_quant is not None:    
+            C = _r2c(self.C - (self.C - max_quant_fn(self.C, quant_levels=self.C_quant)).detach())
+        else:
+            C = _r2c(self.C)
+
         P = _r2c(self.P)
         Q = P.conj()
-        w = self._w() # (n_ssm, N)
-
+        w = self._w(A_quant=self.A_quant) # (n_ssm, N)
+        
         # Address bandlimiting
         if self.bandlimit is not None:
             freqs = w.imag.abs() / (2*math.pi)  # (H, N)
@@ -1033,6 +981,7 @@ class SSKernelDiag(OptimModule):
         real_type='exp',
         lr=None,
         bandlimit=None,
+        **kernel_args
     ):
 
         super().__init__()
@@ -1061,6 +1010,27 @@ class SSKernelDiag(OptimModule):
         self.register("B", _c2r(B), lr_dict.get('B', lr))
         self.register("inv_A_real", self._A_init(A.real), lr_dict.get('A', lr))
         self.register("A_imag", A.imag, lr_dict.get('A', lr))
+
+
+        if 'A_quant' in kernel_args and kernel_args['A_quant'] is not None:
+            self.A_quant = int(kernel_args['A_quant'])
+        else:
+            self.A_quant = None
+
+        if 'B_quant' in kernel_args and kernel_args['B_quant'] is not None:
+            self.B_quant = int(kernel_args['B_quant'])
+        else:
+            self.B_quant = None
+
+        if 'C_quant' in kernel_args and kernel_args['C_quant'] is not None:
+            self.C_quant = int(kernel_args['C_quant'])
+        else:
+            self.C_quant = None
+
+        if 'dt_quant' in kernel_args and kernel_args['dt_quant'] is not None:
+            self.dt_quant = int(kernel_args['dt_quant'])
+        else:
+            self.dt_quant = None
 
     def _A_init(self, A_real):
         A_real = torch.clamp(A_real, max=-1e-4)
@@ -1233,7 +1203,7 @@ class SSKernel(nn.Module):
         dt_max=0.1,
         deterministic=False,
         lr=None,
-        mode="diag",
+        mode="nplr", ################# original is diag!
         n_ssm=None,
         verbose=False,
         measure_args={},
@@ -1441,6 +1411,19 @@ class S4(nn.Module):
                 activate=False,
             )
 
+        if 'kernel_quant' in kernel_args and kernel_args['kernel_quant'] is not None:
+            self.kernel_quant = int(kernel_args['kernel_quant'])
+        else:
+            self.kernel_quant = None
+        if 'linear_quant' in kernel_args and kernel_args['linear_quant'] is not None:
+            self.linear_quant=int(kernel_args['linear_quant'])
+        else:
+            self.linear_quant = None
+        if 'act_quant' in kernel_args and kernel_args['act_quant'] is not None:
+            self.act_quant=int(kernel_args['act_quant'])
+        else:
+            self.act_quant = None
+
         # optional multiplicative modulation GLU-style
         # https://arxiv.org/abs/2002.05202
         self.hyper = hyper_act is not None
@@ -1500,6 +1483,9 @@ class S4(nn.Module):
         L_kernel = L if self.L is None else min(L, round(self.L / rate))
         k, k_state = self.kernel(L=L_kernel, rate=rate, state=state) # (C H L) (B C H L)
 
+        if self.kernel_quant is not None:
+            k = k - (k - max_quant_fn(k, quant_levels=self.kernel_quant)).detach()
+
         # Convolution
         if self.bidirectional:
             k0, k1 = rearrange(k, '(s c) h l -> s c h l', s=2)
@@ -1536,6 +1522,8 @@ class S4(nn.Module):
         if not self.transposed: y = y.transpose(-1, -2)
 
         y = self.output_linear(y)
+        if self.act_quant is not None:
+            y = y - (y - max_quant_fn(y, quant_levels=self.act_quant)).detach()
 
         if self.gate is not None:
             y = self.output_gate(y * v)
@@ -1572,3 +1560,17 @@ class S4(nn.Module):
     @property
     def d_output(self):
         return self.d_model
+
+
+# taken from bitnet 1.58b
+def max_quant_fn(a, quant_levels=2):
+        # scaling parameter to get an estimate of the magnitude of the activations. 
+    # clamp to avoid division by zero
+    #import pdb
+    #pdb.set_trace()
+    scale = quant_levels / 2 / torch.clamp(torch.max(a.abs().flatten(), dim=-1, keepdim=True)[0], min=1e-5) 
+
+    # a * scale normalizes a. rounding brings them to the next integer. 
+    # clamping to cut off values above the quantization limits. / scale to undo normalization
+    a_out = torch.clamp((a * scale).round(), min=-quant_levels // 2, max=quant_levels // 2) / scale
+    return a_out
