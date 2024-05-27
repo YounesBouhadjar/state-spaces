@@ -113,12 +113,17 @@ def LinearActivation(
         transposed=False,
         activation=None,
         activate=False, # Apply activation as part of this module
+        linear_quant=None,
         **kwargs,
     ):
     """ Returns a linear nn.Module with control over axes order, initialization, and activation """
 
     # Construct core module
-    linear_cls = partial(nn.Conv1d, kernel_size=1) if transposed else nn.Linear
+    if linear_quant is None:
+        linear_cls = partial(nn.Conv1d, kernel_size=1) if transposed else nn.Linear
+    else:
+        print("Reached")
+        linear_cls = partial(pt.QuantizedConv1d, kernel_size=1) if transposed else pt.QuantizedLinear
     if activation == 'glu': d_output *= 2
     linear = linear_cls(d_input, d_output, bias=bias, **kwargs)
 
@@ -1385,32 +1390,6 @@ class S4(nn.Module):
         self.gate = gate
         self.bottleneck = bottleneck
 
-        if bottleneck is not None:
-            self.H = self.H // bottleneck
-            self.input_linear = LinearActivation(
-                self.d_model,
-                self.H,
-                transposed=self.transposed,
-                activation=activation,
-                activate=True,
-            )
-
-        if gate is not None:
-            self.input_gate = LinearActivation(
-                self.d_model,
-                self.d_model * gate,
-                transposed=self.transposed,
-                activation=activation,
-                activate=True,
-            )
-            self.output_gate = LinearActivation(
-                self.d_model * gate,
-                self.d_model,
-                transposed=self.transposed,
-                activation=None,
-                activate=False,
-            )
-
         if 'kernel_quant' in kernel_args and kernel_args['kernel_quant'] is not None:
             self.kernel_quant = int(kernel_args['kernel_quant'])
         else:
@@ -1423,6 +1402,35 @@ class S4(nn.Module):
             self.act_quant=int(kernel_args['act_quant'])
         else:
             self.act_quant = None
+
+        if bottleneck is not None:
+            self.H = self.H // bottleneck
+            self.input_linear = LinearActivation(
+                self.d_model,
+                self.H,
+                transposed=self.transposed,
+                activation=activation,
+                activate=True,
+                linear_quant=self.linear_quant,
+            )
+
+        if gate is not None:
+            self.input_gate = LinearActivation(
+                self.d_model,
+                self.d_model * gate,
+                transposed=self.transposed,
+                activation=activation,
+                activate=True,
+                linear_quant=self.linear_quant,
+            )
+            self.output_gate = LinearActivation(
+                self.d_model * gate,
+                self.d_model,
+                transposed=self.transposed,
+                activation=None,
+                activate=False,
+                linear_quant=self.linear_quant,
+            )
 
         # optional multiplicative modulation GLU-style
         # https://arxiv.org/abs/2002.05202
@@ -1451,6 +1459,7 @@ class S4(nn.Module):
             transposed=self.transposed,
             activation=postact,
             activate=True,
+            linear_quant=self.linear_quant,
         )
 
     def forward(self, u, state=None, rate=1.0, lengths=None, **kwargs):
