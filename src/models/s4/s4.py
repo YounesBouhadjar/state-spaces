@@ -1201,14 +1201,14 @@ class SSKernel(nn.Module):
         H,
         N=64,
         L=None,
-        measure="legs",
+        measure="diag-legs", ############### original is legs
         rank=1,
         channels=1,
-        dt_min=0.001,
-        dt_max=0.1,
+        dt_min=0.001, # 0.001
+        dt_max=0.1, #0.1
         deterministic=False,
         lr=None,
-        mode="nplr", ################# original is diag!
+        mode="diag", ################# original is diag!
         n_ssm=None,
         verbose=False,
         measure_args={},
@@ -1335,7 +1335,7 @@ class S4(nn.Module):
     def __init__(
             self,
             d_model,
-            d_state=64,
+            d_state=64, #64 for pathfinder
             l_max=None,
             channels=1,
             bidirectional=False,
@@ -1381,7 +1381,7 @@ class S4(nn.Module):
 
         self.d_model = d_model
         self.H = d_model
-        self.N = d_model #d_state
+        self.N = d_state #d_state
         self.L = l_max
         self.bidirectional = bidirectional
         self.channels = channels
