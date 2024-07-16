@@ -675,7 +675,7 @@ class SSKernelNPLR(OptimModule):
         if self.dt_quant is not None:
             dt = torch.exp((self.log_dt - max_quant_fn(self.log_dt, quant_levels=self.dt_quant)).detach()) * rate
         else:
-            dt = torch.exp(self.log_dt)
+            dt = torch.exp(self.log_dt) * rate
 
         if self.B_quant is not None:
             B = _r2c(self.B - (self.B - max_quant_fn(self.B, quant_levels=self.B_quant)).detach())
@@ -1051,7 +1051,7 @@ class SSKernelDiag(OptimModule):
             return torch.log(torch.exp(-A_real)-1)
         else: raise NotImplementedError
 
-    def _A(self):
+    def _A(self, quant_levels=None):
         # Get the internal A (diagonal) parameter
         if self.real_type == 'none':
             A_real = -self.inv_A_real
@@ -1065,7 +1065,11 @@ class SSKernelDiag(OptimModule):
         elif self.real_type == 'softplus':
             A_real = -F.softplus(self.inv_A_real)
         else: raise NotImplementedError
-        A = A_real + 1j * self.A_imag
+
+        if quant_levels is not None:
+            A = A_real - (A_real - max_quant_fn(A_real, quant_levels=quant_levels)).detach() + 1j * self.A_imag - (self.A_imag - max_quant_fn(self.A_imag, quant_levels=quant_levels)).detach()
+        else:
+            A = A_real + 1j * self.A_imag
         return A
 
     def forward(self, L, state=None, rate=1.0, u=None):
@@ -1079,12 +1083,28 @@ class SSKernelDiag(OptimModule):
         (B, H, L) output from initial state
         """
 
-        dt = torch.exp(self.log_dt) * rate # (H)
-        C = _r2c(self.C) # (C H N)
-        A = self._A() # (H N)
+        #dt = torch.exp(self.log_dt) * rate # (H)
+        #C = _r2c(self.C) # (C H N)
+        A = self._A(quant_levels=self.A_quant) # (H N)
 
-        B = _r2c(self.B)
+        #B = _r2c(self.B)
+        
+
+        if self.dt_quant is not None:
+            dt = torch.exp((self.log_dt - max_quant_fn(self.log_dt, quant_levels=self.dt_quant)).detach()) * rate
+        else:
+            dt = torch.exp(self.log_dt) * rate
+
+        if self.B_quant is not None:
+            B = _r2c(self.B - (self.B - max_quant_fn(self.B, quant_levels=self.B_quant)).detach())
+        else:
+            B = _r2c(self.B)
         B = repeat(B, 't n -> 1 (v t) n', v=self.repeat)
+
+        if self.C_quant is not None:    
+            C = _r2c(self.C - (self.C - max_quant_fn(self.C, quant_levels=self.C_quant)).detach())
+        else:
+            C = _r2c(self.C)
 
         if self.bandlimit is not None:
             freqs = dt[:, None] / rate * A.imag.abs() / (2*math.pi) # (H, N)
@@ -1184,6 +1204,12 @@ class SSKernelDiag(OptimModule):
         v = log_vandermonde_transpose(u, self.dB, self.dA.log(), u.size(-1))
         next_state = AL * state + v
         return next_state
+    
+    def analysis(self):
+        return ((self._A(quant_levels=None).real, self._A(quant_levels=self.A_quant).real), # A_real
+                (self._A(quant_levels=None).imag, self._A(quant_levels=self.A_quant).imag),    # A_imag
+                (self.C, max_quant_fn(self.C, quant_levels=self.C_quant)),              # C
+                (torch.exp(self.log_dt), torch.exp(max_quant_fn(self.log_dt, self.dt_quant))))  # dt
 
 
 class SSKernel(nn.Module):
@@ -1330,6 +1356,9 @@ class SSKernel(nn.Module):
 
     def default_state(self, *args, **kwargs):
         return self.kernel.default_state(*args, **kwargs)
+    
+    def analysis(self):
+        return self.kernel.analysis()
 
 class S4(nn.Module):
     def __init__(
@@ -1402,6 +1431,10 @@ class S4(nn.Module):
             self.act_quant=int(kernel_args['act_quant'])
         else:
             self.act_quant = None
+        if 'state_quant' in kernel_args and kernel_args['state_quant'] is not None:
+            self.state_quant=int(kernel_args['state_quant'])
+        else:
+            self.state_quant = None
 
         if bottleneck is not None:
             self.H = self.H // bottleneck
@@ -1492,8 +1525,9 @@ class S4(nn.Module):
         L_kernel = L if self.L is None else min(L, round(self.L / rate))
         k, k_state = self.kernel(L=L_kernel, rate=rate, state=state) # (C H L) (B C H L)
 
-        if self.kernel_quant is not None:
-            k = k - (k - max_quant_fn(k, quant_levels=self.kernel_quant)).detach()
+        if self.state_quant is not None:
+            k = k - (k - max_quant_fn(k, quant_levels=int(self.state_quant / 2))).detach()
+            u = u - (u - max_quant_fn(u, quant_levels=int(self.state_quant / 2))).detach()
 
         # Convolution
         if self.bidirectional:

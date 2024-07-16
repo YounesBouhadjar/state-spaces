@@ -84,6 +84,12 @@ class S4DKernel(nn.Module):
         K = 2 * torch.einsum('hn, hnl -> hl', C, torch.exp(K)).real
 
         return K
+    
+    def analysis(self):
+        return ((-torch.exp(self.log_A_real), max_quant_fn(-torch.exp(self.log_A_real), quant_levels=self.A_quant)), # A_real
+                (self.A_imag, max_quant_fn(self.A_imag, quant_levels=self.A_quant)),    # A_imag
+                (self.C, max_quant_fn(self.C, quant_levels=self.C_quant)),              # C
+                (torch.exp(self.log_dt), torch.exp(max_quant_fn(self.log_dt, self.dt_quant))))  # dt
 
     def register(self, name, tensor, lr=None):
         """Register a tensor with a configurable learning rate and 0 weight decay"""
@@ -103,8 +109,6 @@ class S4D(nn.Module):
     def __init__(self, d_model, d_state=64, dropout=0.0, transposed=True, **kernel_args):
         super().__init__()
 
-        #kernel_args = model_args['model_args']
-
         self.h = d_model
         self.n = d_state
         self.d_output = self.h
@@ -121,6 +125,10 @@ class S4D(nn.Module):
             self.act_quant=int(kernel_args['act_quant'])
         else:
             self.act_quant = None
+        if 'state_quant' in kernel_args and kernel_args['state_quant'] is not None:
+            self.state_quant=int(kernel_args['state_quant'])
+        else:
+            self.state_quant = None
             
         self.D = nn.Parameter(torch.randn(self.h))
 
@@ -153,8 +161,9 @@ class S4D(nn.Module):
         # Compute SSM Kernel
         k = self.kernel(L=L) # (H L)
 
-        if self.kernel_quant is not None:
-            k = k - (k - max_quant_fn(k, quant_levels=self.kernel_quant)).detach()
+        if self.state_quant is not None:
+            k = k - (k - max_quant_fn(k, quant_levels=int(self.state_quant / 2))).detach()
+            u = u - (u - max_quant_fn(u, quant_levels=int(self.state_quant / 2))).detach()
 
         # Convolution
         k_f = torch.fft.rfft(k, n=2*L) # (H L)
@@ -175,7 +184,9 @@ class S4D(nn.Module):
 
 # taken from bitnet 1.58b
 def max_quant_fn(a, quant_levels=2):
-        # scaling parameter to get an estimate of the magnitude of the activations. 
+    if quant_levels is None:
+        return a
+    # scaling parameter to get an estimate of the magnitude of the activations. 
     # clamp to avoid division by zero
     #import pdb
     #pdb.set_trace()
