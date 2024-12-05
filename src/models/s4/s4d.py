@@ -21,7 +21,7 @@ class S4DKernel(nn.Module):
     """Wrapper around SSKernelDiag that generates the diagonal SSM parameters
     """
 
-    def __init__(self, d_model, N=64, dt_min=0.001, dt_max=0.1, lr=0.001, **kernel_args):
+    def __init__(self, d_model, N=64, dt_min=0.001, dt_max=0.1, lr=0.001, weight_noise=None, **kernel_args):
         super().__init__()
         # Generate dt
         H = d_model
@@ -32,6 +32,7 @@ class S4DKernel(nn.Module):
         C = torch.randn(H, N // 2, dtype=torch.cfloat)
         self.C = nn.Parameter(_c2r(C))
         self.register("log_dt", log_dt, lr)
+        self.weight_noise = weight_noise
 
         if 'A_quant' in kernel_args and kernel_args['A_quant'] is not None:
             self.A_quant = int(kernel_args['A_quant'])
@@ -48,8 +49,16 @@ class S4DKernel(nn.Module):
         else:
             self.dt_quant = None
 
+        if 'defmax' in kernel_args and kernel_args['defmax'] is not None:
+            self.defmax = torch.tensor(float(kernel_args['defmax']))
+        else:
+            self.defmax = None
+
+        if 'defmax_train' in kernel_args and kernel_args['defmax_train'] and self.defmax is not None:
+            self.defmax = nn.Parameter(self.defmax)
+
         log_A_real = torch.log(0.5 * torch.ones(H, N//2))
-        A_imag = math.pi * repeat(torch.arange(N//2), 'n -> h n', h=H)
+        A_imag = math.pi * 1./4 * repeat(torch.arange(N//2), 'n -> h n', h=H)
         self.register("log_A_real", log_A_real, lr)
         self.register("A_imag", A_imag, lr)
 
@@ -70,16 +79,27 @@ class S4DKernel(nn.Module):
             C = _r2c(self.C) # (H N)
         
         if self.A_quant is not None:
-            A_real_quant = -torch.exp(self.log_A_real) - (-torch.exp(self.log_A_real) - max_quant_fn(-torch.exp(self.log_A_real), quant_levels=self.A_quant)).detach()
-            A_imag_quant = self.A_imag - (self.A_imag - max_quant_fn(self.A_imag, quant_levels=self.A_quant)).detach()
+            Amax = torch.maximum(torch.max(torch.abs(torch.exp(self.log_A_real))), torch.max(torch.abs(self.A_imag)))
+            defmax = self.defmax
+
+            A_real_quant = -torch.exp(self.log_A_real) - (-torch.exp(self.log_A_real) - max_quant_fn(-torch.exp(self.log_A_real), quant_levels=self.A_quant, defmax=defmax)).detach()
+            A_imag_quant = self.A_imag - (self.A_imag - max_quant_fn(self.A_imag, quant_levels=self.A_quant, defmax=defmax)).detach()
+            #import pdb
+            #pdb.set_trace()
             A = A_real_quant + 1j * A_imag_quant # (H N)
         else:
             A = -torch.exp(self.log_A_real) + 1j * self.A_imag
+
+        ###### Weight noise #########
+        if self.weight_noise is not None:
+            A = A + (torch.max(A.real) - torch.min(A.real)) * torch.normal(0., self.weight_noise, A.real.shape).to(A.device) + 1j * (torch.max(A.imag) - torch.min(A.imag)) * torch.normal(0., self.weight_noise, A.imag.shape).to(A.device)
+            #C = C + (torch.max(C) - torch.min(C)) * torch.normal(0., self.weight_noise, C.shape).to('cuda:1')
 
         # Vandermonde multiplication
         dtA = A * dt.unsqueeze(-1)  # (H N)
 
         K = dtA.unsqueeze(-1) * torch.arange(L, device=A.device) # (H N L)
+
         C = C * (torch.exp(dtA)-1.) / A
         K = 2 * torch.einsum('hn, hnl -> hl', C, torch.exp(K)).real
 
@@ -141,16 +161,30 @@ class S4D(nn.Module):
         dropout_fn = DropoutNd
         self.dropout = dropout_fn(dropout) if dropout > 0.0 else nn.Identity()
 
+        #import pdb
+        #pdb.set_trace()
+
+        try:
+            if kernel_args['nonlin'] == 'relu':
+                nonlin = nn.ReLU()
+                out_factor = 1
+            else:
+                nonlin = nn.GLU(dim=-2)
+                out_factor = 2
+        except KeyError:
+            nonlin = nn.GLU(dim=-2)
+            out_factor = 2
+            
         # position-wise output transform to mix features
         if self.linear_quant is not None:
             self.output_linear = nn.Sequential(
-                pt.QuantizedConv1d(self.h, 2*self.h, kernel_size=1, quant_fn=pt.max_quant_fn, quant_levels=self.linear_quant),
-                nn.GLU(dim=-2),
+                pt.QuantizedConv1d(self.h, out_factor*self.h, kernel_size=1, quant_fn=pt.max_quant_fn, quant_levels=self.linear_quant),
+                nonlin,
             )
         else:
             self.output_linear = nn.Sequential(
-                nn.Conv1d(self.h, 2*self.h, kernel_size=1),
-                nn.GLU(dim=-2),
+                nn.Conv1d(self.h, out_factor*self.h, kernel_size=1),
+                nonlin,
             )
 
     def forward(self, u, **kwargs): # absorbs return_output and transformer src mask
@@ -174,23 +208,24 @@ class S4D(nn.Module):
         # Compute D term in state space equation - essentially a skip connection
         y = y + u * self.D.unsqueeze(-1)
 
-        y = self.dropout(self.activation(y))
+        y = self.dropout(y)    #(self.activation(y))
         y = self.output_linear(y)
         if self.act_quant is not None:
             y = y - (y - max_quant_fn(y, quant_levels=self.act_quant)).detach()
         if not self.transposed: y = y.transpose(-1, -2)
+        
         return y, None # Return a dummy state to satisfy this repo's interface, but this can be modified
 
 
-# taken from bitnet 1.58b
-def max_quant_fn(a, quant_levels=2):
+def max_quant_fn(a, quant_levels=2, defmax=None):
     if quant_levels is None:
         return a
     # scaling parameter to get an estimate of the magnitude of the activations. 
     # clamp to avoid division by zero
-    #import pdb
-    #pdb.set_trace()
-    scale = quant_levels / 2 / torch.clamp(torch.max(a.abs().flatten(), dim=-1, keepdim=True)[0], min=1e-5) 
+    if defmax is None:
+        scale = quant_levels / 2 / torch.clamp(torch.max(a.abs().flatten(), dim=-1, keepdim=True)[0], min=1e-5) 
+    else:
+        scale = quant_levels / 2 / torch.clamp(defmax, min=1e-5)
 
     # a * scale normalizes a. rounding brings them to the next integer. 
     # clamping to cut off values above the quantization limits. / scale to undo normalization

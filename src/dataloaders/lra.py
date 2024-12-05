@@ -12,7 +12,9 @@ import torchtext
 import torchvision
 from einops.layers.torch import Rearrange, Reduce
 from PIL import Image  # Only used for Pathfinder
-from datasets import DatasetDict, Value, load_dataset
+from datasets import Value
+from datasets import load_dataset
+from datasets import DatasetDict
 
 from src.dataloaders.base import default_data_path, SequenceDataset, ImageResolutionSequenceDataset
 

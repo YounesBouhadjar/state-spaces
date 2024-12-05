@@ -122,7 +122,6 @@ def LinearActivation(
     if linear_quant is None:
         linear_cls = partial(nn.Conv1d, kernel_size=1) if transposed else nn.Linear
     else:
-        print("Reached")
         linear_cls = partial(pt.QuantizedConv1d, kernel_size=1) if transposed else pt.QuantizedLinear
     if activation == 'glu': d_output *= 2
     linear = linear_cls(d_input, d_output, bias=bias, **kwargs)
@@ -1227,14 +1226,14 @@ class SSKernel(nn.Module):
         H,
         N=64,
         L=None,
-        measure="diag-legs", ############### original is legs
+        measure="legs", #"diag-legs", ############### original is legs
         rank=1,
         channels=1,
         dt_min=0.001, # 0.001
         dt_max=0.1, #0.1
         deterministic=False,
         lr=None,
-        mode="diag", ################# original is diag!
+        mode="nplr", #"diag", ################# original is diag!
         n_ssm=None,
         verbose=False,
         measure_args={},
@@ -1262,6 +1261,11 @@ class SSKernel(nn.Module):
         self.mode = mode
         self.verbose = verbose
         self.kernel_args = kernel_args
+
+        if 'measure' in kernel_args and kernel_args['measure'] is not None:
+            measure = kernel_args['measure']
+        if 'mode' in kernel_args and kernels_args['mode'] is not None:
+            self.mode = kernel_args['mode']
 
         # Generate dt
         if deterministic:
