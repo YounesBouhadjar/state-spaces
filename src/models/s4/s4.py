@@ -119,12 +119,13 @@ def LinearActivation(
     """ Returns a linear nn.Module with control over axes order, initialization, and activation """
 
     # Construct core module
+    if activation == 'glu': d_output *= 2
     if linear_quant is None:
         linear_cls = partial(nn.Conv1d, kernel_size=1) if transposed else nn.Linear
+        linear = linear_cls(d_input, d_output, bias=bias, **kwargs)
     else:
         linear_cls = partial(pt.QuantizedConv1d, kernel_size=1) if transposed else pt.QuantizedLinear
-    if activation == 'glu': d_output *= 2
-    linear = linear_cls(d_input, d_output, bias=bias, **kwargs)
+        linear = linear_cls(d_input, d_output, bias=bias, quant_fn=pt.max_quant_fn, quant_levels=linear_quant, **kwargs)
 
     if activate and activation is not None:
         activation = Activation(activation, dim=-2 if transposed else -1)
@@ -611,6 +612,14 @@ class SSKernelNPLR(OptimModule):
         else:
             self.dt_quant = None
 
+        if 'defmax' in kernel_args and kernel_args['defmax'] is not None:
+            self.defmax = torch.tensor(float(kernel_args['defmax']))
+        else:
+            self.defmax = None
+
+        if 'defmax_train' in kernel_args and kernel_args['defmax_train'] and self.defmax is not None:
+            self.defmax = nn.Parameter(self.defmax)
+
     def _w_init(self, w_real):
         w_real = torch.clamp(w_real, max=-self.real_tolerance)
         if self.real_type == 'none':
@@ -625,7 +634,7 @@ class SSKernelNPLR(OptimModule):
             return torch.log(torch.exp(-w_real)-1)
         else: raise NotImplementedError
 
-    def _w(self, A_quant=None):
+    def _w(self, A_quant=None, defmax=None):
         # Get the internal w (diagonal) parameter
         if self.real_type == 'none':
             w_real = -self.inv_w_real
@@ -639,8 +648,8 @@ class SSKernelNPLR(OptimModule):
             w_real = -F.softplus(self.inv_w_real)
         else: raise NotImplementedError
         if A_quant is not None:
-            w = w_real - (w_real - max_quant_fn(w_real, quant_levels=A_quant)).detach() 
-            + 1j * self.w_imag - (self.w_imag - max_quant_fn(self.w_imag, quant_levels=A_quant)).detach()
+            w = w_real - (w_real - max_quant_fn(w_real, quant_levels=A_quant, defmax=defmax)).detach() 
+            + 1j * self.w_imag - (self.w_imag - max_quant_fn(self.w_imag, quant_levels=A_quant, defmax=defmax)).detach()
         else:
             w = w_real + 1j * self.w_imag
         return w
@@ -677,18 +686,18 @@ class SSKernelNPLR(OptimModule):
             dt = torch.exp(self.log_dt) * rate
 
         if self.B_quant is not None:
-            B = _r2c(self.B - (self.B - max_quant_fn(self.B, quant_levels=self.B_quant)).detach())
+            B = _r2c(self.B - (self.B - max_quant_fn(self.B, quant_levels=self.B_quant, defmax=self.defmax)).detach())
         else:
             B = _r2c(self.B)
 
         if self.C_quant is not None:    
-            C = _r2c(self.C - (self.C - max_quant_fn(self.C, quant_levels=self.C_quant)).detach())
+            C = _r2c(self.C - (self.C - max_quant_fn(self.C, quant_levels=self.C_quant, defmax=self.defmax)).detach())
         else:
             C = _r2c(self.C)
 
         P = _r2c(self.P)
         Q = P.conj()
-        w = self._w(A_quant=self.A_quant) # (n_ssm, N)
+        w = self._w(A_quant=self.A_quant, defmax=self.defmax) # (n_ssm, N)
         
         # Address bandlimiting
         if self.bandlimit is not None:
@@ -1609,13 +1618,15 @@ class S4(nn.Module):
         return self.d_model
 
 
-# taken from bitnet 1.58b
-def max_quant_fn(a, quant_levels=2):
-        # scaling parameter to get an estimate of the magnitude of the activations. 
+def max_quant_fn(a, quant_levels=2, defmax=None):
+    if quant_levels is None:
+        return a
+    # scaling parameter to get an estimate of the magnitude of the activations. 
     # clamp to avoid division by zero
-    #import pdb
-    #pdb.set_trace()
-    scale = quant_levels / 2 / torch.clamp(torch.max(a.abs().flatten(), dim=-1, keepdim=True)[0], min=1e-5) 
+    if defmax is None:
+        scale = quant_levels / 2 / torch.clamp(torch.max(a.abs().flatten(), dim=-1, keepdim=True)[0], min=1e-5) 
+    else:
+        scale = quant_levels / 2 / torch.clamp(defmax, min=1e-5)
 
     # a * scale normalizes a. rounding brings them to the next integer. 
     # clamping to cut off values above the quantization limits. / scale to undo normalization

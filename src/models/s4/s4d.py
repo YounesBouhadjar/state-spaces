@@ -126,10 +126,15 @@ class S4DKernel(nn.Module):
 
 class S4D(nn.Module):
 
-    def __init__(self, d_model, d_state=64, dropout=0.0, transposed=True, **kernel_args):
+    def __init__(self, d_model, d_state=64, dropout=0.0, transposed=True, d_model_next=None, **kernel_args):
         super().__init__()
 
         self.h = d_model
+        if d_model_next is None:
+            self.d_model_next = d_model
+        else:
+            self.d_model_next = d_model_next
+
         self.n = d_state
         self.d_output = self.h
         self.transposed = transposed
@@ -178,12 +183,12 @@ class S4D(nn.Module):
         # position-wise output transform to mix features
         if self.linear_quant is not None:
             self.output_linear = nn.Sequential(
-                pt.QuantizedConv1d(self.h, out_factor*self.h, kernel_size=1, quant_fn=pt.max_quant_fn, quant_levels=self.linear_quant),
+                pt.QuantizedConv1d(self.h, out_factor*self.d_model_next, kernel_size=1, quant_fn=pt.max_quant_fn, quant_levels=self.linear_quant),
                 nonlin,
             )
         else:
             self.output_linear = nn.Sequential(
-                nn.Conv1d(self.h, out_factor*self.h, kernel_size=1),
+                nn.Conv1d(self.h, out_factor*self.d_model_next, kernel_size=1),
                 nonlin,
             )
 
@@ -208,7 +213,7 @@ class S4D(nn.Module):
         # Compute D term in state space equation - essentially a skip connection
         y = y + u * self.D.unsqueeze(-1)
 
-        y = self.dropout(y)    #(self.activation(y))
+        y = self.dropout(y) #(self.activation(y))
         y = self.output_linear(y)
         if self.act_quant is not None:
             y = y - (y - max_quant_fn(y, quant_levels=self.act_quant)).detach()
